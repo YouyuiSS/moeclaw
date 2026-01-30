@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   mkdtempSync,
   rmSync,
   renameSync,
@@ -48,8 +49,8 @@ const DEFAULT_ELEVENLABS_VOICE_ID = "pMsXgVXv3BLzUgSXRplE";
 const DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2";
 const DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts";
 const DEFAULT_OPENAI_VOICE = "alloy";
-const DEFAULT_EDGE_VOICE = "en-US-MichelleNeural";
-const DEFAULT_EDGE_LANG = "en-US";
+const DEFAULT_EDGE_VOICE = "zh-CN-XiaoyiNeural";
+const DEFAULT_EDGE_LANG = "zh-CN";
 const DEFAULT_EDGE_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
 
 const DEFAULT_ELEVENLABS_VOICE_SETTINGS = {
@@ -1238,6 +1239,12 @@ export async function textToSpeech(params: {
       } else {
         lastError = `${provider}: ${error.message}`;
       }
+      try {
+        appendFileSync(
+          "debug-tts-error.log",
+          `[${new Date().toISOString()}] Provider ${provider} failed: ${error.message || error}\n${error.stack || ""}\n\n`,
+        );
+      } catch {}
     }
   }
 

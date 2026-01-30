@@ -36,13 +36,27 @@ export function createTtsTool(opts?: {
       });
 
       if (result.success && result.audioPath) {
+        let mediaUrl = result.audioPath;
+        try {
+          const fs = await import("node:fs");
+          const buffer = fs.readFileSync(result.audioPath);
+          const base64 = buffer.toString("base64");
+          const ext = result.audioPath.split(".").pop()?.toLowerCase();
+          let mime = "audio/mpeg";
+          if (ext === "opus") mime = "audio/ogg";
+          else if (ext === "wav") mime = "audio/wav";
+          mediaUrl = `data:${mime};base64,${base64}`;
+        } catch {
+          // Fallback to path if read fails (unlikely)
+        }
+
         const lines: string[] = [];
         // Tag Telegram Opus output as a voice bubble instead of a file attachment.
         if (result.voiceCompatible) lines.push("[[audio_as_voice]]");
-        lines.push(`MEDIA:${result.audioPath}`);
+        lines.push(`MEDIA:${mediaUrl}`);
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { audioPath: result.audioPath, provider: result.provider },
+          details: { audioPath: mediaUrl, provider: result.provider },
         };
       }
 

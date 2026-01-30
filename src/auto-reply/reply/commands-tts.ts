@@ -124,8 +124,21 @@ export const handleTtsCommands: CommandHandler = async (params, allowTextCommand
         provider: result.provider,
         latencyMs: result.latencyMs,
       });
+      let mediaUrl = result.audioPath;
+      try {
+        const fs = await import("node:fs");
+        const buffer = fs.readFileSync(result.audioPath);
+        const base64 = buffer.toString("base64");
+        const ext = result.audioPath.split(".").pop()?.toLowerCase();
+        let mime = "audio/mpeg";
+        if (ext === "opus") mime = "audio/ogg";
+        else if (ext === "wav") mime = "audio/wav";
+        mediaUrl = `data:${mime};base64,${base64}`;
+      } catch {
+        // Fallback to path if read fails (unlikely)
+      }
       const payload: ReplyPayload = {
-        mediaUrl: result.audioPath,
+        mediaUrl: mediaUrl,
         audioAsVoice: result.voiceCompatible === true,
       };
       return { shouldContinue: false, reply: payload };

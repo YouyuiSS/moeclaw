@@ -16,9 +16,11 @@ function cleanCandidate(raw: string) {
 
 function isValidMedia(candidate: string, opts?: { allowSpaces?: boolean }) {
   if (!candidate) return false;
-  if (candidate.length > 4096) return false;
+  const isData = /^data:/i.test(candidate);
+  if (!isData && candidate.length > 4096) return false;
   if (!opts?.allowSpaces && /\s/.test(candidate)) return false;
   if (/^https?:\/\//i.test(candidate)) return true;
+  if (isData) return true;
   if (candidate.startsWith("/")) return true;
   if (candidate.startsWith("./")) return true;
   if (candidate.startsWith("../")) return true;

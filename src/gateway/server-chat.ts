@@ -2,7 +2,9 @@ import { normalizeVerboseLevel } from "../auto-reply/thinking.js";
 import { loadConfig } from "../config/config.js";
 import { type AgentEventPayload, getAgentRunContext } from "../infra/agent-events.js";
 import { resolveHeartbeatVisibility } from "../infra/heartbeat-visibility.js";
+import { isTtsEnabled, resolveTtsConfig, resolveTtsPrefsPath, textToSpeech } from "../tts/tts.js";
 import { loadSessionEntry } from "./session-utils.js";
+import { cleanTextForTts } from "../utils/text-cleaner.js";
 import { formatForLog } from "./ws-log.js";
 
 /**
@@ -81,6 +83,7 @@ export function createChatRunRegistry(): ChatRunRegistry {
 export type ChatRunState = {
   registry: ChatRunRegistry;
   buffers: Map<string, string>;
+  mediaBuffers: Map<string, string[]>;
   deltaSentAt: Map<string, number>;
   abortedRuns: Map<string, number>;
   clear: () => void;
@@ -89,12 +92,14 @@ export type ChatRunState = {
 export function createChatRunState(): ChatRunState {
   const registry = createChatRunRegistry();
   const buffers = new Map<string, string>();
+  const mediaBuffers = new Map<string, string[]>();
   const deltaSentAt = new Map<string, number>();
   const abortedRuns = new Map<string, number>();
 
   const clear = () => {
     registry.clear();
     buffers.clear();
+    mediaBuffers.clear();
     deltaSentAt.clear();
     abortedRuns.clear();
   };
@@ -102,6 +107,7 @@ export function createChatRunState(): ChatRunState {
   return {
     registry,
     buffers,
+    mediaBuffers,
     deltaSentAt,
     abortedRuns,
     clear,
@@ -133,8 +139,17 @@ export function createAgentEventHandler({
   resolveSessionKeyForRun,
   clearAgentRunContext,
 }: AgentEventHandlerOptions) {
-  const emitChatDelta = (sessionKey: string, clientRunId: string, seq: number, text: string) => {
+  const emitChatDelta = (
+    sessionKey: string,
+    clientRunId: string,
+    seq: number,
+    text: string,
+    mediaUrls?: string[],
+  ) => {
     chatRunState.buffers.set(clientRunId, text);
+    if (mediaUrls && mediaUrls.length > 0) {
+      chatRunState.mediaBuffers.set(clientRunId, mediaUrls);
+    }
     const now = Date.now();
     const last = chatRunState.deltaSentAt.get(clientRunId) ?? 0;
     if (now - last < 150) return;
@@ -157,7 +172,7 @@ export function createAgentEventHandler({
     nodeSendToSession(sessionKey, "chat", payload);
   };
 
-  const emitChatFinal = (
+  const emitChatFinal = async (
     sessionKey: string,
     clientRunId: string,
     seq: number,
@@ -165,24 +180,79 @@ export function createAgentEventHandler({
     error?: unknown,
   ) => {
     const text = chatRunState.buffers.get(clientRunId)?.trim() ?? "";
+    const mediaUrls = chatRunState.mediaBuffers.get(clientRunId);
     chatRunState.buffers.delete(clientRunId);
+    chatRunState.mediaBuffers.delete(clientRunId);
     chatRunState.deltaSentAt.delete(clientRunId);
+
+    // Capture suppression state early before any async/await ensures context is still available
+    const suppressBroadcast = shouldSuppressHeartbeatBroadcast(clientRunId);
+
+    let finalMediaUrls = mediaUrls;
+
+    if (jobState === "done" && text && (!mediaUrls || mediaUrls.length === 0)) {
+      try {
+        const cfg = loadConfig();
+        const config = resolveTtsConfig(cfg);
+        const prefsPath = resolveTtsPrefsPath(config);
+
+        // Check if TTS is enabled for this session/globally
+
+        if (isTtsEnabled(config, prefsPath)) {
+          // Basic check. ideally we check session override too but loadSessionEntry does that partly via config?
+          // Actually isTtsEnabled takes config and returns boolean.
+
+          const cleanText = cleanTextForTts(text);
+
+          const ttsResult = await textToSpeech({
+            text: cleanText,
+            cfg,
+            prefsPath,
+            // channel? We don't have channel info strictly here, but could pass 'webchat' or similar if needed
+            // For now, undefined channel uses default provider
+          });
+
+          if (ttsResult.success && ttsResult.audioPath) {
+            let mediaUrl = ttsResult.audioPath;
+            try {
+              const fs = await import("node:fs");
+              const buffer = fs.readFileSync(ttsResult.audioPath);
+              const base64 = buffer.toString("base64");
+              const ext = ttsResult.audioPath.split(".").pop()?.toLowerCase();
+              let mime = "audio/mpeg";
+              if (ext === "opus") mime = "audio/ogg";
+              else if (ext === "wav") mime = "audio/wav";
+              mediaUrl = `data:${mime};base64,${base64}`;
+              finalMediaUrls = [mediaUrl];
+            } catch (e) {
+              console.error("Auto-TTS read error:", e);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Auto-TTS injection failed:", err);
+      }
+    }
+
     if (jobState === "done") {
+      const hasContent = text || (finalMediaUrls && finalMediaUrls.length > 0);
       const payload = {
         runId: clientRunId,
         sessionKey,
         seq,
         state: "final" as const,
-        message: text
+        message: hasContent
           ? {
               role: "assistant",
               content: [{ type: "text", text }],
               timestamp: Date.now(),
+              mediaUrl: finalMediaUrls?.[0],
+              mediaUrls: finalMediaUrls?.length ? finalMediaUrls : undefined,
             }
           : undefined,
       };
       // Suppress webchat broadcast for heartbeat runs when showOk is false
-      if (!shouldSuppressHeartbeatBroadcast(clientRunId)) {
+      if (!suppressBroadcast) {
         broadcast("chat", payload);
       }
       nodeSendToSession(sessionKey, "chat", payload);
@@ -221,6 +291,15 @@ export function createAgentEventHandler({
     const clientRunId = chatLink?.clientRunId ?? evt.runId;
     const isAborted =
       chatRunState.abortedRuns.has(clientRunId) || chatRunState.abortedRuns.has(evt.runId);
+    // DEBUG: Trace sessionKey resolution for webchat events
+    if (evt.stream === "assistant" || evt.stream === "lifecycle") {
+      const textPreview = typeof evt.data?.text === "string" ? evt.data.text.slice(0, 50) : "N/A";
+      const hasMedia =
+        Array.isArray(evt.data?.mediaUrls) && (evt.data.mediaUrls as unknown[]).length > 0;
+      console.log(
+        `[server-chat] evt.runId=${evt.runId} stream=${evt.stream} chatLink=${!!chatLink} sessionKey=${sessionKey ?? "UNDEFINED"} text=${textPreview} media=${hasMedia ? (evt.data?.mediaUrls as unknown[]).length : 0}`,
+      );
+    }
     // Include sessionKey so Control UI can filter tool streams per session.
     const agentPayload = sessionKey ? { ...evt, sessionKey } : evt;
     const last = agentRunSeq.get(evt.runId) ?? 0;
@@ -250,7 +329,8 @@ export function createAgentEventHandler({
     if (sessionKey) {
       nodeSendToSession(sessionKey, "agent", agentPayload);
       if (!isAborted && evt.stream === "assistant" && typeof evt.data?.text === "string") {
-        emitChatDelta(sessionKey, clientRunId, evt.seq, evt.data.text);
+        const mediaUrls = Array.isArray(evt.data.mediaUrls) ? evt.data.mediaUrls : undefined;
+        emitChatDelta(sessionKey, clientRunId, evt.seq, evt.data.text, mediaUrls);
       } else if (!isAborted && (lifecyclePhase === "end" || lifecyclePhase === "error")) {
         if (chatLink) {
           const finished = chatRunState.registry.shift(evt.runId);
@@ -265,6 +345,7 @@ export function createAgentEventHandler({
             lifecyclePhase === "error" ? "error" : "done",
             evt.data?.error,
           );
+          clearAgentRunContext(evt.runId);
         } else {
           emitChatFinal(
             sessionKey,
@@ -283,10 +364,6 @@ export function createAgentEventHandler({
           chatRunState.registry.remove(evt.runId, clientRunId, sessionKey);
         }
       }
-    }
-
-    if (lifecyclePhase === "end" || lifecyclePhase === "error") {
-      clearAgentRunContext(evt.runId);
     }
   };
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+
 import module from "node:module";
 
 // https://nodejs.org/api/module.html#module-compile-cache
